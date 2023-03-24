@@ -1,0 +1,429 @@
+"""
+    This Python script takes a paragraph as input, 
+    and runs it successively through ChatGPT to extract a shortened version
+    that performs "nearly-extractive" summarization: a version with deleted words/phrases that don't
+    contribute to the overall meaning, and minimal word changes or additions.
+
+    The algorithm is as follows:
+        0. We choose N (number of responses per query to ChatGPT), 
+           and D, the "max depth", or how many times we'll repeat the loop and successively shorten.
+           d, the current depth, is set to 0.
+        1. We collect N responses from ChatGPT for each paragraph P input, for some variety. 
+        2. We run each response R through a diff-checker to detect how many adding/changed words
+          there were (since ChatGPT is imperfect in rigidly sticking to our instructions).
+        3. We pick the response R_min that:
+            - minimizes the number of added/changed words, and 
+            - maximizes the number of deletions.
+        4. Store the response at depth 'd'. Increment 'd' by one.
+        5. If 'd' < 'D', run R_min back through ChatGPT as input (set P=R_min and goto Step 1).
+"""
+import openai, sys, os
+import argparse
+from collections import Counter
+from termcolor import colored, RESET
+from difflib import SequenceMatcher
+from promptengine.pipelines import PromptPipeline
+from promptengine.template import PromptTemplate, PromptPermutationGenerator
+from promptengine.utils import LLM, extract_responses
+from diff_text import diff_text
+
+EXTRACTIVE_SHORTENER_PROMPT_TEMPLATE = \
+"""Delete 10 words or phrases from the following paragraph that don't contribute much to its meaning, but keep readability:
+"${paragraph}"
+
+Please do not add any new words or change words, only delete words."""
+
+# PromptPipeline that runs the 'extractive shortner' prompt, and cache's responses.
+class ExtractiveShortenerPromptPipeline(PromptPipeline):
+    def __init__(self):
+        self._template = PromptTemplate(EXTRACTIVE_SHORTENER_PROMPT_TEMPLATE)
+        storageFile = 'shortened_responses.json'
+        super().__init__(storageFile)
+    def gen_prompts(self, properties):
+        gen_prompts = PromptPermutationGenerator(self._template)
+        return list(gen_prompts({
+            "paragraph": properties["paragraph"]
+        }))
+
+# Script start
+if __name__ == "__main__":
+
+    parser = argparse.ArgumentParser(description='This script performs word-level extractive summarization through ChatGPT, at successive degrees of word importance.')
+    parser.add_argument('paragraph', help='Input paragraph/text', type=str)
+    parser.add_argument('--depth', help='The number of successive shortenings to perform (rounds of feeding the text through ChatGPT)', type=int, default=3, nargs='?')
+    parser.add_argument('--n', help='The number of responses to request from ChatGPT, for *each* query', type=int, default=8, nargs='?')
+    parser.add_argument('--temp', help='The temperature for ChatGPT calls', type=float, default=1.0, nargs='?')
+    parser.add_argument('--interactive', help="Instead of picking the 'best' response at each depth automatically, you enter the # of the response to choose.", dest='interactive', action='store_true')
+    parser.add_argument('--no-cache', help="Don't cache the responses or load responses from the cache.", dest='no_cache', action='store_true')
+    args = parser.parse_args()
+
+    # The number of responses to request from ChatGPT, for *each* query
+    N = args.n
+
+    # The 'max depth', or number of successive times we'll try to shorten
+    MAX_DEPTH = args.depth
+
+    # The temperature for ChatGPT calls
+    TEMPERATURE = args.temp
+
+    # Whether interactive mode is on
+    INTERACTIVE_STEERING = args.interactive is True
+
+    if 'paragraph' not in args:
+        print("Please provide some text to shorten as the first argument.")
+        is_correct = False
+    else:
+        paragraph = args.paragraph
+        
+        print(f"\nOkay, I will run the extractive shortener on the paragraph:\n{paragraph}\n")
+        print(f"There will be {MAX_DEPTH} rounds of shortening, and {N} queries per round.")
+        inp = input("Do you wish to proceed? (Y): ")
+        is_correct = inp.strip() == 'Y'
+
+    # Show the user the input paragraph, to double-check it's what they want:
+    if not is_correct:
+        print("Aborting.")
+        exit(1)
+    
+    orig_paragraph = paragraph[:]
+
+    try:
+        openai.api_key = os.environ['OPENAI_API_KEY']
+    except KeyError as e:
+        openai.api_key = input("Please enter your OpenAI API key: ")
+
+    def strip_wrapping_quotes(s: str) -> str:
+        if s[0] == '"': s = s[1:]
+        if s[-1] == '"': s = s[0:-1]
+        return s
+    
+    cur_depth = 0
+
+    # The extractive shortener prompt pipeline
+    extractive_shortener = ExtractiveShortenerPromptPipeline()
+
+    if args.no_cache is True:
+        extractive_shortener.clear_cached_responses()
+
+    # Store the best responses at each depth
+    best_responses = []
+
+    while cur_depth < MAX_DEPTH:
+        print('\n\n')
+        print("*"*50 + f" Depth {cur_depth} of {MAX_DEPTH-1} " + "*"*50)
+        print(f"Running extractive shortener with N={N} on paragraph:\n{paragraph}\n\n")
+
+        # Run the pipeline by calling ChatGPT
+        responses = []
+        for res in extractive_shortener.gen_responses({"paragraph": paragraph}, LLM.ChatGPT, n=N, temperature=TEMPERATURE):
+            responses.extend(extract_responses(res, llm=LLM.ChatGPT))
+        
+        # Cleanup responses to remove any wrapping double-quotes:
+        responses = [strip_wrapping_quotes(r) for r in responses]
+        
+        # Run the responses through the diff-checker:
+        response_infos = []
+        for n, response in enumerate(responses):
+            print("-"*80)
+            print(f"Diff for response #{n}:")
+            opcodes = diff_text(paragraph, response, print_result=True)
+            print()
+
+            # Calculate the counts of each operation in 'opcodes':
+            counts = Counter([op[0] for op in opcodes])  # the first opcode is the tag name, one of: 'equal', 'delete', 'replace', 'insert'
+            print(counts)
+
+            # Store the info
+            response_infos.append({
+                "response": response,
+                "opcodes": opcodes,
+                "counts": counts,
+            })
+        
+        print("-"*80)
+
+        if INTERACTIVE_STEERING:
+            id_num = ""
+            num_responses = len(response_infos)
+            print("Look at the responses above. Choose the best response (most human-readable, with a good number of deletions, but minimal insertions).")
+            while not id_num.isnumeric() or int(id_num) < 0 or int(id_num) >= num_responses:
+                id_num = input(f"Enter the id number of the response you choose as the best (0-{num_responses-1}): ")
+            best_response = response_infos[int(id_num)]
+        else:
+            # Choose the 'best' response by a heuristic.
+            print("Sorting responses...")
+
+            # Sort responses by max number of 'delete' operations, 
+            # penalized by the number of 'replace' operations. 
+            # NOTE: Choice of '4' is heuristic! 
+            response_infos.sort(key=lambda x: x["counts"]["delete"] - x["counts"]["replace"]*4, reverse=True)
+            for r in response_infos:
+                print(r["counts"])
+
+            # Sort the responses by counts, putting those that 'insert'ed words last:
+            print("-"*80)
+            response_infos.sort(key=lambda x: x["counts"]["insert"])
+            for r in response_infos:
+                print(r["counts"])
+            
+            # Now, this is another heuristic --the 'top' response can
+            # sometimes be a TON of deletions, that don't make sense. We therefore don't want 
+            # to pick the most number of deletions, but instead the runner-up:
+            best_response = response_infos[1]
+
+        # Increment depth:
+        cur_depth += 1
+
+        # Now, if cur_depth is less than MAX_DEPTH, the next iteration of the loop will feed the response back into ChatGPT:
+        best_responses.append(best_response)
+        paragraph = best_response["response"]
+
+    print("*"*50 + f" Exited loop at depth {cur_depth-1} " + "*"*50)
+    print("Chosen responses at each depth:")
+    print("-"*30 + " Depth=0 (the original input text) " + "-"*30)
+    print(orig_paragraph)
+    past_response = orig_paragraph
+    for n, r in enumerate(best_responses):
+        print("-"*30 + f" Depth={n+1} " + "-"*30)
+        response = r['response']
+        print(response)
+        print(f"Text length reduced by {len(past_response) - len(response)} characters, compared to previous level. ({len(past_response)} -> {len(response)})")
+        print("*"*20 + " -- diff -- " + "*"*20)
+        diff_text(past_response, response, print_result=True)
+        past_response = response
+    
+    print("\n\n" + "="*50 + " ~ Calculating depth visualization ~ " + "="*50)
+    
+    """
+        Now we want to produce a 'grayed depth' visualization from the chosen best responses.
+        To do this, we'll need to give special consideration to 'replace' operations, e.g.:
+            (an urgent ->a), (that involve ->involving)
+        For these operations, we need to perform a fine-grained diff, this time on characters, not words.
+        From that diff, we will see what *characters* to grey, and which to keep at the same level of salience. 
+    """
+    # To start, we can't use the original input text directly, or we'll deal with white space issues.
+    # Instead, we want to reconstruct the text after normalizing whitespace using .split():
+    split_orig_para = orig_paragraph.split()
+    normed_orig_para = ' '.join(split_orig_para)  # Now we are sure every 'word' is separated by exactly one space.
+
+    # Get responses in form [(a, b), (b, c), (c, d), so on], so it's easier to compare each successive level.
+    response_pairs = [({"response":normed_orig_para}, best_responses[0])]
+    if len(best_responses) > 1:
+        response_pairs.extend(zip(best_responses, best_responses[1:]))
+
+    # Each *character* of the input text will be assigned a degree of 'salience' corresponding to its depth:
+    char_depths = [0] * len(normed_orig_para)  # everything starts at depth 0 (most salient)
+
+    def char_idx_for_word_idx(_word_idx: int, words: list):
+        return sum(len(words[i])+1 for i in range(0, _word_idx))
+
+    def del_char_map_range(char_map, _start: int, _end: int):
+        # What this function does is better explained with an example.
+        # Suppose we have the sentence:
+        #   Is it cool
+        #   0123456789    <-- current char_map
+        # Now we want to remove 'it' to map it to:
+        #   Is cool
+        #   0123456    <-- char indices of the revised text
+        # The char indices must update to point to their place in the revised text:
+        #   Is it cool
+        #   012xxx3456    <-- char_map with 'x' for 'None' (removed char)
+        # Note how the remaining char indices were shifted 'left'.
+        del_len = _end - _start + 1
+        for i in range(_start, _end+1):
+            if i >= len(char_map):
+                print("Warning: Shifting char map index left: Index out of range. Skipping...")
+                continue
+            char_map[i] = None  # None means there's no mapping, bc char has been deleted
+        for i in range(_end+1, len(char_map)):
+            # We need to update all remaining indices to shift 'left' 
+            # to account for the deletions:
+            if i >= len(char_map):
+                print("Warning: Shifting char map index left: Index out of range. Skipping...")
+                continue
+            elif char_map[i] is None:
+                print("Warning: Shifting char map index left with None value. Skipping...")
+                continue
+            char_map[i] -= del_len
+    
+    def insert_char_map_range(char_map: list, _start: int, _len: int):
+        # Same as above, except for insertions. 
+        # Suppose we have the sentence:
+        #   Is cool
+        #   0123456    <-- current char_map
+        # Now we want to add 'it' in the revised text:
+        #   Is it cool
+        #   0123456789    <-- char indices of the revised text
+        # The char indices must shift 'right' to point to their place in the revised text:
+        #   Is cool
+        #   0126789    <-- char_map with shifted indices that skip the inserted portion
+        # So everything after insertion _start index must be shifted by +3, which is the length of 'it ', the inserted text
+        if _len <= 0:
+            return  # nothing to insert
+        for i in range(_start, len(char_map)):
+            if char_map[i] is None:
+                print("Warning: Shifting char map index right with None value. Skipping...")
+                continue
+            char_map[i] += _len
+    
+    def invert_char_map(char_map: list) -> dict:
+        # Inverts the partial relation 'char_map', returning a dict {idx: idx} (int -> int)
+        inv_map = {}
+        for i,j in enumerate(char_map):
+            if j is None:  # drop the deleted chars
+                continue
+            inv_map[j] = i
+        return inv_map
+    
+    def get_orig_text_char_idx(char_idx: int, *inv_char_maps) -> int:
+        # Given a list of (inverted) char_maps (dicts) and a character index for the current text,
+        # returns the index of the character in the original text (e.g., at highest depth), if possible.
+        # If not possible (e.g., char was added later and so doesn't exist in original text), returns -1.
+        if len(inv_char_maps) == 0: return char_idx
+        # Follow the inverse char maps back:
+        cur_idx = char_idx
+        for icm in inv_char_maps:
+            if cur_idx not in icm:
+                return -1
+            cur_idx = icm[cur_idx]
+        return cur_idx
+    
+    def set_depth(_start_idx: int, _end_idx: int, _depth: int):
+        for d_idx in range(_start_idx, _end_idx+1):
+            char_depths[d_idx] = _depth
+
+    # Loop through shortening pairs (a, b)
+    depth = len(response_pairs)
+    inv_char_maps = []
+    for prev, cur in response_pairs:
+        print("-"*20 + f"Depth {MAX_DEPTH-depth}" + "-"*20)
+        opcodes = cur["opcodes"]
+
+        split_prev_para = prev["response"].split()
+        normed_prev_para = ' '.join(split_prev_para)
+
+        split_cur_para = cur["response"].split()
+        normed_cur_para = ' '.join(split_cur_para)
+
+        # A mapping of char indices: from char index of the 'prev' depth's text, 
+        # to char index of the 'cur' depth's text. We will invert this partial relation
+        # to understand how a char in the lowest depth (shortest response) maps back up to higher levels. 
+        char_map_to_cur = [i for i, _ in enumerate(normed_prev_para)]
+
+        for opcode in opcodes:
+            # i1, i2 is the beginning and end of 'prev'; j1, j2 is the same for 'cur'
+            # Note that indices are of *words* in the tokenized texts: *not* of character locations.
+            # To get character locations, we must map back to the original text, which is the text with .split() run on it. 
+            (tag, i1, i2, j1, j2) = opcode
+
+            if tag == 'equal':
+                # Even if it thinks the words are equal, there could be punctuation marks 
+                # within them that have changed/been inserted (the diff'er ignores punctuation)
+                # We need to know about this, for the char_map to remain correct.
+                for rel_wrd_idx, prev_wrd in enumerate(split_prev_para[i1:i2]):
+                    start_char_idx = char_idx_for_word_idx(i1+rel_wrd_idx, split_prev_para)
+                    cur_wrd = split_cur_para[j1+rel_wrd_idx]
+                    if len(prev_wrd) != len(cur_wrd):  # mismatching 'matched' words
+                        wrd_differ = SequenceMatcher(None, prev_wrd, cur_wrd)
+                        print(f'found different chars in matched words:  "{prev_wrd}" <--> "{cur_wrd}"')
+                        print('   ops:', wrd_differ.get_opcodes())
+
+                        for wrd_opcode in wrd_differ.get_opcodes():
+                            if wrd_opcode[0] in ('replace', 'delete'):
+                                print('   -->', start_char_idx+wrd_opcode[1], start_char_idx+wrd_opcode[2], normed_orig_para[start_char_idx+wrd_opcode[1]:start_char_idx+wrd_opcode[2]])
+
+                                del_char_map_range(
+                                    char_map_to_cur, 
+                                    start_char_idx+wrd_opcode[1], 
+                                    start_char_idx+wrd_opcode[2]-1
+                                )
+                            if wrd_opcode[0] in ('replace', 'insert'):  # we also need to account for any inserted text:
+                                insert_char_map_range(
+                                    char_map_to_cur, 
+                                    start_char_idx+wrd_opcode[1], # the starting char index of the original text where the insertion takes place
+                                    wrd_opcode[4]-wrd_opcode[3]  # the length of the inserted text, in # of chars
+                                )
+            elif tag == 'delete':
+                # Gray the entire span of chars for the deleted words:
+                start_char_idx = char_idx_for_word_idx(i1, split_prev_para)
+                end_char_idx = char_idx_for_word_idx(i2, split_prev_para)
+                print(f"marked deleted span: {normed_prev_para[start_char_idx:end_char_idx]}", start_char_idx, end_char_idx)
+                del_char_map_range(
+                    char_map_to_cur, 
+                    start_char_idx, 
+                    end_char_idx-1
+                )
+            elif tag == 'replace':
+                # Get the character indices for the replaced span of words
+                start_char_idx = char_idx_for_word_idx(i1, split_prev_para)
+                end_char_idx = char_idx_for_word_idx(i2, split_prev_para)
+
+                resp_start_char_idx = char_idx_for_word_idx(j1, split_cur_para)
+                resp_end_char_idx = char_idx_for_word_idx(j2, split_cur_para)
+
+                # Get the replaced range of chars as a string:
+                p1 = normed_prev_para[start_char_idx:end_char_idx]
+                p2 = normed_cur_para[resp_start_char_idx:resp_end_char_idx]
+
+                print(f"marked replacement: ({p1}) -> ({p2})")
+
+                # We diff on characters, and then gray whatever chars are *NOT* 'equal' according to the differ: 
+                char_differ = SequenceMatcher(None, p1, p2)
+                for char_opcode in char_differ.get_opcodes():
+                    print(char_opcode)
+                    if char_opcode[0] in ('replace', 'delete'):
+                        print(' -->', start_char_idx+char_opcode[1], start_char_idx+char_opcode[2], normed_orig_para[start_char_idx+char_opcode[1]:start_char_idx+char_opcode[2]])
+
+                        del_char_map_range(
+                            char_map_to_cur, 
+                            start_char_idx+char_opcode[1], 
+                            start_char_idx+char_opcode[2]-1
+                        )
+                        
+                    if char_opcode[0] in ('replace', 'insert'):  # we also need to account for any inserted text:
+                        insert_char_map_range(
+                            char_map_to_cur, 
+                            start_char_idx+char_opcode[1], # the starting char index of the original text where the insertion takes place
+                            char_opcode[4]-char_opcode[3]  # the length of the inserted text, in # of chars
+                        )
+            elif tag == 'insert':
+                start_char_idx = char_idx_for_word_idx(i1, split_prev_para)
+                resp_start_char_idx = char_idx_for_word_idx(j1, split_cur_para)
+                resp_end_char_idx = char_idx_for_word_idx(j2, split_cur_para)-1
+                print(f"marked insertion: {normed_cur_para[resp_start_char_idx:resp_end_char_idx+1]}")
+                insert_char_map_range(
+                    char_map_to_cur, 
+                    start_char_idx, # the starting char index of the original text where the insertion takes place
+                    resp_end_char_idx-resp_start_char_idx+1  # the length of the inserted text, in # of chars
+                )
+        
+        # We now have a partial mapping 'char_map_to_cur' from the indices of chars in the 'prev' text, to the 'cur' (revised) text.
+        # We can use this 1-level deep mapping to apply the depth mask to the original text, using previous inv_char_maps
+        for i, j in enumerate(char_map_to_cur):
+            if j is None:  # this char was deleted, so mark it
+                orig_char_idx = get_orig_text_char_idx(i, *reversed(inv_char_maps))
+                if orig_char_idx > -1:
+                    set_depth(orig_char_idx, orig_char_idx, depth)
+                else:
+                    print(f" --- could not follow char {normed_prev_para[i]} at idx, depth: {i}, {MAX_DEPTH - depth}")
+
+        # We also need to invert this mapping for it to be useful later on:
+        inv_char_maps.append(
+            invert_char_map(char_map_to_cur)
+        )
+        
+        depth -= 1
+
+    # Visualize the graying:
+    # NOTE: In the console, we don't have access to good levels of gray, so we use colors instead
+    print("-"*20 + " Word relevance visualization " + "-"*20)
+    for i, c in enumerate(normed_orig_para):
+        print(RESET, end='')
+        color = 'white'
+        if char_depths[i] > 2:
+            color = 'blue'
+        elif char_depths[i] > 1:
+            color = 'green'
+        elif char_depths[i] > 0:
+            color = 'yellow'
+        print(colored(c, color), end='')
