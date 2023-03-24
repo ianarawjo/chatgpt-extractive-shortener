@@ -420,10 +420,10 @@ if __name__ == "__main__":
     for i, c in enumerate(normed_orig_para):
         print(RESET, end='')
         color = 'white'
-        if char_depths[i] > 2:
+        if char_depths[i] >= MAX_DEPTH:
             color = 'blue'
-        elif char_depths[i] > 1:
+        elif char_depths[i] >= MAX_DEPTH-1:
             color = 'green'
-        elif char_depths[i] > 0:
+        elif char_depths[i] >= MAX_DEPTH-2:
             color = 'yellow'
         print(colored(c, color), end='')
