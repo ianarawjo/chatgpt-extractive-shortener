@@ -17,14 +17,14 @@
         4. Store the response at depth 'd'. Increment 'd' by one.
         5. If 'd' < 'D', run R_min back through ChatGPT as input (set P=R_min and goto Step 1).
 """
-import openai, sys, os
+import openai, sys, os, re, json
 import argparse
 from collections import Counter
 from termcolor import colored, RESET
 from difflib import SequenceMatcher
 from promptengine.pipelines import PromptPipeline
 from promptengine.template import PromptTemplate, PromptPermutationGenerator
-from promptengine.utils import LLM, extract_responses
+from promptengine.utils import LLM, extract_responses, is_valid_filepath
 from diff_text import diff_text
 
 EXTRACTIVE_SHORTENER_PROMPT_TEMPLATE = \
@@ -32,6 +32,8 @@ EXTRACTIVE_SHORTENER_PROMPT_TEMPLATE = \
 "${paragraph}"
 
 Please do not add any new words or change words, only delete words."""
+
+HTML_GRAY_LEVELS = ['#000000', '#767676', '#A0A0A0', '#B9B9B9', '#D0D0D0']
 
 # PromptPipeline that runs the 'extractive shortner' prompt, and cache's responses.
 class ExtractiveShortenerPromptPipeline(PromptPipeline):
@@ -45,6 +47,28 @@ class ExtractiveShortenerPromptPipeline(PromptPipeline):
             "paragraph": properties["paragraph"]
         }))
 
+def extract_sentences_from_para(paragraph: str) -> list:
+    return re.split(r'(?<!\w\.\w.)(?<![A-Z][a-z]\.)(?<=\.|\?)\s', paragraph)
+
+def extract_contiguous_sequences(arr):
+    sequences = []
+    prev_num = None
+    cur_sequence = {}
+    for i, num in enumerate(arr):
+        if i == 0:
+            cur_sequence['start'] = num
+            cur_sequence['val'] = num
+        elif num != prev_num:
+            cur_sequence['end'] = i
+            sequences.append(cur_sequence)
+            cur_sequence = {'start': i, 'val': num}
+        prev_num = num
+    
+    cur_sequence['end'] = len(arr)
+    sequences.append(cur_sequence)
+
+    return sequences
+
 # Script start
 if __name__ == "__main__":
 
@@ -54,6 +78,8 @@ if __name__ == "__main__":
     parser.add_argument('--n', help='The number of responses to request from ChatGPT, for *each* query', type=int, default=8, nargs='?')
     parser.add_argument('--temp', help='The temperature for ChatGPT calls', type=float, default=1.0, nargs='?')
     parser.add_argument('--interactive', help="Instead of picking the 'best' response at each depth automatically, you enter the # of the response to choose.", dest='interactive', action='store_true')
+    parser.add_argument('--json', help="Whether to output the successive shorteners in a JSON file. Outputs at the level of individual sentences. NOTE: Output is less useful if number of sentences changed between edits.", type=str, default=None, dest='json_output', nargs='?')
+    parser.add_argument('--html', help="Outputs a 'graying visualization' of HTML code, with <span>s to color segments of text. (NOTE: Only works for up to five levels of depth.)", dest='html_output', action='store_true')
     parser.add_argument('--no-cache', help="Don't cache the responses or load responses from the cache.", dest='no_cache', action='store_true')
     args = parser.parse_args()
 
@@ -68,6 +94,11 @@ if __name__ == "__main__":
 
     # Whether interactive mode is on
     INTERACTIVE_STEERING = args.interactive is True
+
+    # Double-check JSON filepath is correct, if specific:
+    if args.json_output is not None:
+        if not is_valid_filepath(args.json_output):
+            raise Exception(f"Invalid filepath for JSON output: {args.json_output}")
 
     if 'paragraph' not in args:
         print("Please provide some text to shorten as the first argument.")
@@ -107,6 +138,7 @@ if __name__ == "__main__":
 
     # Store the best responses at each depth
     best_responses = []
+    best_response_ids = []
 
     while cur_depth < MAX_DEPTH:
         print('\n\n')
@@ -148,6 +180,7 @@ if __name__ == "__main__":
             print("Look at the responses above. Choose the best response (most human-readable, with a good number of deletions, but minimal insertions).")
             while not id_num.isnumeric() or int(id_num) < 0 or int(id_num) >= num_responses:
                 id_num = input(f"Enter the id number of the response you choose as the best (0-{num_responses-1}): ")
+            best_response_ids.append(id_num)
             best_response = response_infos[int(id_num)]
         else:
             # Choose the 'best' response by a heuristic.
@@ -188,6 +221,8 @@ if __name__ == "__main__":
         response = r['response']
         print(response)
         print(f"Text length reduced by {len(past_response) - len(response)} characters, compared to previous level. ({len(past_response)} -> {len(response)})")
+        if INTERACTIVE_STEERING:
+            print(f"NOTE: Interactive mode: This was response #{best_response_ids[n]}")
         print("*"*20 + " -- diff -- " + "*"*20)
         diff_text(past_response, response, print_result=True)
         past_response = response
@@ -414,8 +449,41 @@ if __name__ == "__main__":
         
         depth -= 1
 
+    # OPTIONAL: JSON output
+    if args.json_output:
+        outpath = args.json_output
+
+        # Extract sentences for each response, at each depth:
+        resp_sentences = []
+        all_responses = [{'response': orig_paragraph}] + best_responses
+        for n, r in enumerate(all_responses):
+            resp_sentences.append(extract_sentences_from_para(r['response']))
+        
+        # Check if a sentence was deleted between shortening rounds.
+        num_sentences = len(resp_sentences[0])
+        if any(len(sentences) != num_sentences for sentences in resp_sentences[1:]):
+            print("Warning: The number of sentences changed between shortening rounds. JSON output will be inaccurate.")
+
+        # Need to convert to form: 
+        # [{"0":"...", "1":..., "2":...}, {...}, {...}]  (for example, for 3 depths, 3 sentences)
+        out = []
+        for i in range(num_sentences):
+            sentence_depths = {}
+            for n, sentences in enumerate(resp_sentences):
+                if i >= len(sentences):
+                    sentence_depths[str(n)] = ""
+                else:
+                    sentence_depths[str(n)] = sentences[i]
+            out.append(sentence_depths)
+        
+        print("-"*20 + " JSON output (NOTE: This may be only a guideline.) " + "-"*20)
+        print(json.dumps(out, indent=2))
+        with open(outpath, "w") as f:
+            json.dump(out, f)
+
     # Visualize the graying:
     # NOTE: In the console, we don't have access to good levels of gray, so we use colors instead
+    print("\n")
     print("-"*20 + " Word relevance visualization " + "-"*20)
     for i, c in enumerate(normed_orig_para):
         print(RESET, end='')
@@ -427,3 +495,17 @@ if __name__ == "__main__":
         elif char_depths[i] >= MAX_DEPTH-2:
             color = 'yellow'
         print(colored(c, color), end='')
+    
+    # HTML output
+    if args.html_output is True:
+        print("\n")
+        print("-"*20 + " HTML code for word relevance visualization (greying) " + "-"*20)
+        # Finds continuous sequences characters with the same character depth:
+        sequences = extract_contiguous_sequences(char_depths)
+        # Produces HTML with spans wrapped around each sequence that was the same depth:
+        html_code = ""
+        for seq in sequences:
+            start, end, depth = seq['start'], seq['end'], seq['val']
+            color_id = depth if depth < len(HTML_GRAY_LEVELS) else (len(HTML_GRAY_LEVELS)-1)
+            html_code += f'<span style="color:{HTML_GRAY_LEVELS[color_id]}">' + normed_orig_para[start:end] + '</span>'
+        print(html_code)
