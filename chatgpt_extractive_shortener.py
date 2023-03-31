@@ -33,7 +33,7 @@ EXTRACTIVE_SHORTENER_PROMPT_TEMPLATE = \
 
 Please do not add any new words or change words, only delete words."""
 
-HTML_GRAY_LEVELS = ['#000000', '#767676', '#A0A0A0', '#B9B9B9', '#D0D0D0']
+HTML_GRAY_LEVELS = ['#000000', '#767676', '#A0A0A0', '#B5B5B5', '#D0D0D0']
 
 # PromptPipeline that runs the 'extractive shortner' prompt, and cache's responses.
 class ExtractiveShortenerPromptPipeline(PromptPipeline):
@@ -56,7 +56,7 @@ def extract_contiguous_sequences(arr):
     cur_sequence = {}
     for i, num in enumerate(arr):
         if i == 0:
-            cur_sequence['start'] = num
+            cur_sequence['start'] = i
             cur_sequence['val'] = num
         elif num != prev_num:
             cur_sequence['end'] = i
