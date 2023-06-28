@@ -26,6 +26,7 @@ from promptengine.pipelines import PromptPipeline
 from promptengine.template import PromptTemplate, PromptPermutationGenerator
 from promptengine.utils import LLM, extract_responses, is_valid_filepath
 from diff_text import diff_text
+import eval
 
 EXTRACTIVE_SHORTENER_PROMPT_TEMPLATE = \
 """Delete 10 words or phrases from the following paragraph that don't contribute much to its meaning, but keep readability:
@@ -81,6 +82,7 @@ if __name__ == "__main__":
     parser.add_argument('--json', help="Whether to output the successive shorteners in a JSON file. Outputs at the level of individual sentences. NOTE: Output is less useful if number of sentences changed between edits.", type=str, default=None, dest='json_output', nargs='?')
     parser.add_argument('--html', help="Outputs a 'graying visualization' of HTML code, with <span>s to color segments of text. (NOTE: Only works for up to five levels of depth.)", dest='html_output', action='store_true')
     parser.add_argument('--no-cache', help="Don't cache the responses or load responses from the cache.", dest='no_cache', action='store_true')
+    parser.add_argument('--auto', help="Automatically pick the best response from the n responses", dest='auto', action='store_true')
     args = parser.parse_args()
 
     # The number of responses to request from ChatGPT, for *each* query
