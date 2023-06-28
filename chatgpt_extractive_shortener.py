@@ -35,6 +35,7 @@ EXTRACTIVE_SHORTENER_PROMPT_TEMPLATE = \
 Please do not add any new words or change words, only delete words."""
 
 HTML_GRAY_LEVELS = ['#000000', '#767676', '#A0A0A0', '#B5B5B5', '#D0D0D0']
+LATEX_GRAY_CODES = ['BLACK', 'GRAY0', 'GRAY1', 'GRAY2', 'GRAY3']
 
 # PromptPipeline that runs the 'extractive shortner' prompt, and cache's responses.
 class ExtractiveShortenerPromptPipeline(PromptPipeline):
@@ -83,6 +84,7 @@ if __name__ == "__main__":
     parser.add_argument('--html', help="Outputs a 'graying visualization' of HTML code, with <span>s to color segments of text. (NOTE: Only works for up to five levels of depth.)", dest='html_output', action='store_true')
     parser.add_argument('--no-cache', help="Don't cache the responses or load responses from the cache.", dest='no_cache', action='store_true')
     parser.add_argument('--auto', help="Automatically pick the best response from the n responses", dest='auto', action='store_true')
+    parser.add_argument('--latex', help="Outputs a 'graying visualization' in LaTeX code with predefined \\textcolor colors GRAY0, GRAY1 etc.", dest='latex_output', action='store_true')
     args = parser.parse_args()
 
     # The number of responses to request from ChatGPT, for *each* query
@@ -511,3 +513,20 @@ if __name__ == "__main__":
             color_id = depth if depth < len(HTML_GRAY_LEVELS) else (len(HTML_GRAY_LEVELS)-1)
             html_code += f'<span style="color:{HTML_GRAY_LEVELS[color_id]}">' + normed_orig_para[start:end] + '</span>'
         print(html_code)
+    
+    # LaTeX output
+    if args.latex_output is True:
+        print("\n")
+        print("-"*20 + " LaTeX code for word relevance visualization (greying) " + "-"*20)
+        # Finds continuous sequences characters with the same character depth:
+        sequences = extract_contiguous_sequences(char_depths)
+        # Produces LaTeX with \textcolor{}{} wrapped around each sequence that was the same depth:
+        latex_code = ""
+        for seq in sequences:
+            start, end, depth = seq['start'], seq['end'], seq['val']
+            color_id = depth if depth < len(LATEX_GRAY_CODES) else (len(LATEX_GRAY_CODES)-1)
+            if depth == 0:
+                latex_code += normed_orig_para[start:end]
+            else:
+                latex_code += '\\textcolor{' + LATEX_GRAY_CODES[color_id] + '}{' + normed_orig_para[start:end] + '}'
+        print(latex_code)
