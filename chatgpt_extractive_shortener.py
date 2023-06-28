@@ -99,6 +99,8 @@ if __name__ == "__main__":
     # Whether interactive mode is on
     INTERACTIVE_STEERING = args.interactive is True
 
+    AUTO_PICK = args.auto is True
+
     # Double-check JSON filepath is correct, if specific:
     if args.json_output is not None:
         if not is_valid_filepath(args.json_output):
@@ -187,26 +189,31 @@ if __name__ == "__main__":
             best_response_ids.append(id_num)
             best_response = response_infos[int(id_num)]
         else:
-            # Choose the 'best' response by a heuristic.
-            print("Sorting responses...")
+            if AUTO_PICK:
+                response_infos.sort(key=lambda x: eval.composite(paragraph, x["response"]), reverse=True)
+                best_response = response_infos[0]
+                best_response["response"] = eval.revert_paraphrasing(paragraph, best_response["response"])
+            else: 
+                # Choose the 'best' response by a heuristic.
+                print("Sorting responses...")
 
-            # Sort responses by max number of 'delete' operations, 
-            # penalized by the number of 'replace' operations. 
-            # NOTE: Choice of '4' is heuristic! 
-            response_infos.sort(key=lambda x: x["counts"]["delete"] - x["counts"]["replace"]*4, reverse=True)
-            for r in response_infos:
-                print(r["counts"])
+                # Sort responses by max number of 'delete' operations, 
+                # penalized by the number of 'replace' operations. 
+                # NOTE: Choice of '4' is heuristic! 
+                response_infos.sort(key=lambda x: x["counts"]["delete"] - x["counts"]["replace"]*4, reverse=True)
+                for r in response_infos:
+                    print(r["counts"])
 
-            # Sort the responses by counts, putting those that 'insert'ed words last:
-            print("-"*80)
-            response_infos.sort(key=lambda x: x["counts"]["insert"])
-            for r in response_infos:
-                print(r["counts"])
-            
-            # Now, this is another heuristic --the 'top' response can
-            # sometimes be a TON of deletions, that don't make sense. We therefore don't want 
-            # to pick the most number of deletions, but instead the runner-up:
-            best_response = response_infos[1]
+                # Sort the responses by counts, putting those that 'insert'ed words last:
+                print("-"*80)
+                response_infos.sort(key=lambda x: x["counts"]["insert"])
+                for r in response_infos:
+                    print(r["counts"])
+                
+                # Now, this is another heuristic --the 'top' response can
+                # sometimes be a TON of deletions, that don't make sense. We therefore don't want 
+                # to pick the most number of deletions, but instead the runner-up:
+                best_response = response_infos[1]
 
         # Increment depth:
         cur_depth += 1
