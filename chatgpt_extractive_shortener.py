@@ -26,7 +26,7 @@ from promptengine.pipelines import PromptPipeline
 from promptengine.template import PromptTemplate, PromptPermutationGenerator
 from promptengine.utils import LLM, extract_responses, is_valid_filepath
 from diff_text import diff_text
-import eval
+import eval_response
 
 EXTRACTIVE_SHORTENER_PROMPT_TEMPLATE = \
 """Delete 10 words or phrases from the following paragraph that don't contribute much to its meaning, but keep readability:
@@ -190,9 +190,9 @@ if __name__ == "__main__":
             best_response = response_infos[int(id_num)]
         else:
             if AUTO_PICK:
-                response_infos.sort(key=lambda x: eval.composite(paragraph, x["response"]), reverse=True)
+                response_infos.sort(key=lambda x: eval_response.composite(paragraph, x["response"]), reverse=True)
                 best_response = response_infos[0]
-                best_response["response"] = eval.revert_paraphrasing(paragraph, best_response["response"])
+                best_response["response"] = eval_response.revert_paraphrasing(paragraph, best_response["response"])
             else: 
                 # Choose the 'best' response by a heuristic.
                 print("Sorting responses...")
