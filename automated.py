@@ -29,7 +29,7 @@ from diff_text import diff_text
 import eval_response
 
 EXTRACTIVE_SHORTENER_PROMPT_TEMPLATE = \
-"""Delete 10 words or phrases from the following paragraph that don't contribute much to its meaning, but keep readability:
+"""Shorten the following paragraph without paraphrasing:
 "${paragraph}"
 
 Please do not add any new words or change words, only delete words."""
