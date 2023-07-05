@@ -12,7 +12,7 @@ import diff_text
 # B = 0.25
 # C = 0.25
 # D = 0.25 
-OPTIMAL_LENGTH = 0.8
+OPTIMAL_LENGTH = 0.7
 
 
 def evaluate_on_meaning(original_paragraph, response):
@@ -33,7 +33,7 @@ def evaluate_on_length(original_paragraph, response):
   Could be used to infer whether unnecessary phrases are indeed removed
   Returns: a float (length shortened/length original)
   '''
-  return abs(len(response)/len(original_paragraph) - OPTIMAL_LENGTH)
+  return 1 - abs(len(response)/len(original_paragraph) - OPTIMAL_LENGTH)
 
 
 def evaluate_on_paraphrasing(original_paragraph, response):
