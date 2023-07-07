@@ -67,10 +67,10 @@ def evaluate_on_paraphrasing(original_paragraph, response):
 #       return 0
 #   return 1
 
-def composite(original_paragraph, response):
+def composite(original_paragraph, response, grammar_score):
   # print('The composite score is ' + str(A*evaluate_on_meaning(original_paragraph, response) + B*evaluate_on_length(original_paragraph, response) + C*evaluate_on_paraphrasing(original_paragraph, response) + D* evaluate_on_grammaticality(response)))
-  return evaluate_on_meaning(original_paragraph, response) + evaluate_on_length(original_paragraph, response)
-
+  return evaluate_on_meaning(original_paragraph, response) + evaluate_on_length(original_paragraph, response) + grammar_score
+ 
 def revert_paraphrasing(original_paragraph, response):
   p1 = original_paragraph.split()
   p2 = response.split()

@@ -34,6 +34,13 @@ EXTRACTIVE_SHORTENER_PROMPT_TEMPLATE = \
 
 Please do not add any new words or change words, only delete words."""
 
+GRAMMAR_CHECKER_PROMPT_TEMPLATE = \
+"""Score the following paragraph by how grammatical it is.
+"${paragraph}"
+
+Answer A for grammatically correct, B for moderately grammatical, and C for bad grammar. Only respond with the answer letter."""
+
+GRAMMER_SCORE_RULE = {'A': 1, 'B': 0.5, 'C': 0}
 HTML_GRAY_LEVELS = ['#000000', '#767676', '#A0A0A0', '#B5B5B5', '#D0D0D0']
 LATEX_GRAY_CODES = ['BLACK', 'GRAY0', 'GRAY1', 'GRAY2', 'GRAY3']
 
@@ -42,6 +49,18 @@ class ExtractiveShortenerPromptPipeline(PromptPipeline):
     def __init__(self):
         self._template = PromptTemplate(EXTRACTIVE_SHORTENER_PROMPT_TEMPLATE)
         storageFile = 'shortened_responses.json'
+        super().__init__(storageFile)
+    def gen_prompts(self, properties):
+        gen_prompts = PromptPermutationGenerator(self._template)
+        return list(gen_prompts({
+            "paragraph": properties["paragraph"]
+        }))
+    
+# PromptPipeline that runs the 'grammar checker' prompt, and cache's responses.
+class GrammarCheckerPromptPipeline(PromptPipeline):
+    def __init__(self):
+        self._template = PromptTemplate(GRAMMAR_CHECKER_PROMPT_TEMPLATE)
+        storageFile = 'grammar_checks.json'
         super().__init__(storageFile)
     def gen_prompts(self, properties):
         gen_prompts = PromptPermutationGenerator(self._template)
@@ -139,6 +158,10 @@ if __name__ == "__main__":
 
     extractive_shortener.clear_cached_responses()
 
+
+    # The grammar_checker prompt pipeline
+    grammar_checker = GrammarCheckerPromptPipeline()
+
     # Store the best responses at each depth
     best_responses = []
     best_response_ids = []
@@ -152,7 +175,7 @@ if __name__ == "__main__":
         responses = []
         for res in extractive_shortener.gen_responses({"paragraph": paragraph}, LLM.ChatGPT, n=N, temperature=TEMPERATURE):
             responses.extend(extract_responses(res, llm=LLM.ChatGPT))
-        
+
         # Cleanup responses to remove any wrapping double-quotes:
         responses = [strip_wrapping_quotes(r) for r in responses]
         
@@ -164,16 +187,22 @@ if __name__ == "__main__":
             # Calculate the counts of each operation in 'opcodes':
             counts = Counter([op[0] for op in opcodes])  # the first opcode is the tag name, one of: 'equal', 'delete', 'replace', 'insert'
 
+            grammar_scores = []
+            # Get grammar score
+            grammar_checker.clear_cached_responses()
+            for score in grammar_checker.gen_responses({"paragraph": response}, LLM.ChatGPT, n=1):
+                grammar_scores.extend(extract_responses(score, llm=LLM.ChatGPT))
             # Store the info
             response_infos.append({
                 "response": response,
                 "opcodes": opcodes,
                 "counts": counts,
+                "grammar_score": grammar_scores[0]
             })
         
 
 
-        response_infos.sort(key=lambda x: eval_response.composite(paragraph, x["response"]), reverse=True)
+        response_infos.sort(key=lambda x: eval_response.composite(paragraph, x["response"], GRAMMER_SCORE_RULE[x["grammar_score"]]), reverse=True)
         best_response = response_infos[0]
         best_response["response"] = eval_response.revert_paraphrasing(paragraph, best_response["response"])
 
