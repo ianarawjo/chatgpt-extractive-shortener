@@ -29,7 +29,7 @@ from diff_text import diff_text
 import eval_response
 
 EXTRACTIVE_SHORTENER_PROMPT_TEMPLATE = \
-"""Shorten the following paragraph without paraphrasing:
+"""Delete 10 words or phrases from the following paragraph that don't contribute much to its meaning, but keep readability:
 "${paragraph}"
 
 Please do not add any new words or change words, only delete words."""
@@ -38,7 +38,7 @@ GRAMMAR_CHECKER_PROMPT_TEMPLATE = \
 """Score the following paragraph by how grammatical it is.
 "${paragraph}"
 
-Answer A for grammatically correct, B for moderately grammatical, and C for bad grammar. Only respond with the answer letter."""
+Answer A for grammatically correct, B for moderately grammatical, and C for bad grammar. Only respond with one letter."""
 
 GRAMMER_SCORE_RULE = {'A': 1, 'B': 0.5, 'C': 0}
 HTML_GRAY_LEVELS = ['#000000', '#767676', '#A0A0A0', '#B5B5B5', '#D0D0D0']
@@ -89,6 +89,11 @@ def extract_contiguous_sequences(arr):
     sequences.append(cur_sequence)
 
     return sequences
+
+def find_score(score):
+    if 'Answer' in score:
+        return score[7:] # Skip the Answer part
+    return score
 
 # Script start
 if __name__ == "__main__":
@@ -192,19 +197,21 @@ if __name__ == "__main__":
             grammar_checker.clear_cached_responses()
             for score in grammar_checker.gen_responses({"paragraph": response}, LLM.ChatGPT, n=1):
                 grammar_scores.extend(extract_responses(score, llm=LLM.ChatGPT))
+
+            grammar_score = GRAMMER_SCORE_RULE[find_score(grammar_scores[0])]
             # Store the info
             response_infos.append({
                 "response": response,
+                "reverted": eval_response.revert_paraphrasing(paragraph, response),
                 "opcodes": opcodes,
                 "counts": counts,
-                "grammar_score": grammar_scores[0]
+                "grammar_score": grammar_score,
+                "composite_score": eval_response.composite(paragraph, response, grammar_score)
             })
-        
 
-
-        response_infos.sort(key=lambda x: eval_response.composite(paragraph, x["response"], GRAMMER_SCORE_RULE[x["grammar_score"]]), reverse=True)
+        response_infos.sort(key=lambda x: x["composite_score"], reverse=True)
         best_response = response_infos[0]
-        best_response["response"] = eval_response.revert_paraphrasing(paragraph, best_response["response"])
+        best_response["response"] = best_response["reverted"]
 
 
         # Increment depth:
@@ -214,9 +221,309 @@ if __name__ == "__main__":
         best_responses.append(best_response)
         paragraph = best_response["response"]
 
+        print('\n')
+        print('Round ' + str(cur_depth) + ' Intermediate Results')
+        for i, item in enumerate(response_infos):
+            print('\n')
+            print(item["reverted"])
+            print('Grammar Score: ' + str(item["grammar_score"]))
+            print('Composite Score: ' + str(item["composite_score"]))
+            if i == 0:
+                print('(Picked)')
+
+
     print('\n')
     print('Here are the shortened results:\n')
     for i, item in enumerate(best_responses):
         
         print('Level ' + str(i) + ': ' + item["response"])
         print('\n\n')
+
+    split_orig_para = orig_paragraph.split()
+    normed_orig_para = ' '.join(split_orig_para)  # Now we are sure every 'word' is separated by exactly one space.
+
+    # Get responses in form [(a, b), (b, c), (c, d), so on], so it's easier to compare each successive level.
+    response_pairs = [({"response":normed_orig_para}, best_responses[0])]
+    if len(best_responses) > 1:
+        response_pairs.extend(zip(best_responses, best_responses[1:]))
+
+    # Each *character* of the input text will be assigned a degree of 'salience' corresponding to its depth:
+    char_depths = [0] * len(normed_orig_para)  # everything starts at depth 0 (most salient)
+
+    def char_idx_for_word_idx(_word_idx: int, words: list):
+        return sum(len(words[i])+1 for i in range(0, _word_idx))
+
+    def del_char_map_range(char_map, _start: int, _end: int):
+        # What this function does is better explained with an example.
+        # Suppose we have the sentence:
+        #   Is it cool
+        #   0123456789    <-- current char_map
+        # Now we want to remove 'it' to map it to:
+        #   Is cool
+        #   0123456    <-- char indices of the revised text
+        # The char indices must update to point to their place in the revised text:
+        #   Is it cool
+        #   012xxx3456    <-- char_map with 'x' for 'None' (removed char)
+        # Note how the remaining char indices were shifted 'left'.
+        del_len = _end - _start + 1
+        for i in range(_start, _end+1):
+            if i >= len(char_map):
+                print("Warning: Shifting char map index left: Index out of range. Skipping...")
+                continue
+            char_map[i] = None  # None means there's no mapping, bc char has been deleted
+        for i in range(_end+1, len(char_map)):
+            # We need to update all remaining indices to shift 'left' 
+            # to account for the deletions:
+            if i >= len(char_map):
+                print("Warning: Shifting char map index left: Index out of range. Skipping...")
+                continue
+            elif char_map[i] is None:
+                print("Warning: Shifting char map index left with None value. Skipping...")
+                continue
+            char_map[i] -= del_len
+    
+    def insert_char_map_range(char_map: list, _start: int, _len: int):
+        # Same as above, except for insertions. 
+        # Suppose we have the sentence:
+        #   Is cool
+        #   0123456    <-- current char_map
+        # Now we want to add 'it' in the revised text:
+        #   Is it cool
+        #   0123456789    <-- char indices of the revised text
+        # The char indices must shift 'right' to point to their place in the revised text:
+        #   Is cool
+        #   0126789    <-- char_map with shifted indices that skip the inserted portion
+        # So everything after insertion _start index must be shifted by +3, which is the length of 'it ', the inserted text
+        if _len <= 0:
+            return  # nothing to insert
+        for i in range(_start, len(char_map)):
+            if char_map[i] is None:
+                print("Warning: Shifting char map index right with None value. Skipping...")
+                continue
+            char_map[i] += _len
+    
+    def invert_char_map(char_map: list) -> dict:
+        # Inverts the partial relation 'char_map', returning a dict {idx: idx} (int -> int)
+        inv_map = {}
+        for i,j in enumerate(char_map):
+            if j is None:  # drop the deleted chars
+                continue
+            inv_map[j] = i
+        return inv_map
+    
+    def get_orig_text_char_idx(char_idx: int, *inv_char_maps) -> int:
+        # Given a list of (inverted) char_maps (dicts) and a character index for the current text,
+        # returns the index of the character in the original text (e.g., at highest depth), if possible.
+        # If not possible (e.g., char was added later and so doesn't exist in original text), returns -1.
+        if len(inv_char_maps) == 0: return char_idx
+        # Follow the inverse char maps back:
+        cur_idx = char_idx
+        for icm in inv_char_maps:
+            if cur_idx not in icm:
+                return -1
+            cur_idx = icm[cur_idx]
+        return cur_idx
+    
+    def set_depth(_start_idx: int, _end_idx: int, _depth: int):
+        for d_idx in range(_start_idx, _end_idx+1):
+            char_depths[d_idx] = _depth
+
+    # Loop through shortening pairs (a, b)
+    depth = len(response_pairs)
+    inv_char_maps = []
+    for prev, cur in response_pairs:
+        print("-"*20 + f"Depth {MAX_DEPTH-depth}" + "-"*20)
+        opcodes = cur["opcodes"]
+
+        split_prev_para = prev["response"].split()
+        normed_prev_para = ' '.join(split_prev_para)
+
+        split_cur_para = cur["response"].split()
+        normed_cur_para = ' '.join(split_cur_para)
+
+        # A mapping of char indices: from char index of the 'prev' depth's text, 
+        # to char index of the 'cur' depth's text. We will invert this partial relation
+        # to understand how a char in the lowest depth (shortest response) maps back up to higher levels. 
+        char_map_to_cur = [i for i, _ in enumerate(normed_prev_para)]
+
+        for opcode in opcodes:
+            # i1, i2 is the beginning and end of 'prev'; j1, j2 is the same for 'cur'
+            # Note that indices are of *words* in the tokenized texts: *not* of character locations.
+            # To get character locations, we must map back to the original text, which is the text with .split() run on it. 
+            (tag, i1, i2, j1, j2) = opcode
+
+            if tag == 'equal':
+                # Even if it thinks the words are equal, there could be punctuation marks 
+                # within them that have changed/been inserted (the diff'er ignores punctuation)
+                # We need to know about this, for the char_map to remain correct.
+                for rel_wrd_idx, prev_wrd in enumerate(split_prev_para[i1:i2]):
+                    start_char_idx = char_idx_for_word_idx(i1+rel_wrd_idx, split_prev_para)
+                    cur_wrd = split_cur_para[j1+rel_wrd_idx]
+                    if len(prev_wrd) != len(cur_wrd):  # mismatching 'matched' words
+                        wrd_differ = SequenceMatcher(None, prev_wrd, cur_wrd)
+                        print(f'found different chars in matched words:  "{prev_wrd}" <--> "{cur_wrd}"')
+                        print('   ops:', wrd_differ.get_opcodes())
+
+                        for wrd_opcode in wrd_differ.get_opcodes():
+                            if wrd_opcode[0] in ('replace', 'delete'):
+                                print('   -->', start_char_idx+wrd_opcode[1], start_char_idx+wrd_opcode[2], normed_orig_para[start_char_idx+wrd_opcode[1]:start_char_idx+wrd_opcode[2]])
+
+                                del_char_map_range(
+                                    char_map_to_cur, 
+                                    start_char_idx+wrd_opcode[1], 
+                                    start_char_idx+wrd_opcode[2]-1
+                                )
+                            if wrd_opcode[0] in ('replace', 'insert'):  # we also need to account for any inserted text:
+                                insert_char_map_range(
+                                    char_map_to_cur, 
+                                    start_char_idx+wrd_opcode[1], # the starting char index of the original text where the insertion takes place
+                                    wrd_opcode[4]-wrd_opcode[3]  # the length of the inserted text, in # of chars
+                                )
+            elif tag == 'delete':
+                # Gray the entire span of chars for the deleted words:
+                start_char_idx = char_idx_for_word_idx(i1, split_prev_para)
+                end_char_idx = char_idx_for_word_idx(i2, split_prev_para)
+                print(f"marked deleted span: {normed_prev_para[start_char_idx:end_char_idx]}", start_char_idx, end_char_idx)
+                del_char_map_range(
+                    char_map_to_cur, 
+                    start_char_idx, 
+                    end_char_idx-1
+                )
+            elif tag == 'replace':
+                # Get the character indices for the replaced span of words
+                start_char_idx = char_idx_for_word_idx(i1, split_prev_para)
+                end_char_idx = char_idx_for_word_idx(i2, split_prev_para)
+
+                resp_start_char_idx = char_idx_for_word_idx(j1, split_cur_para)
+                resp_end_char_idx = char_idx_for_word_idx(j2, split_cur_para)
+
+                # Get the replaced range of chars as a string:
+                p1 = normed_prev_para[start_char_idx:end_char_idx]
+                p2 = normed_cur_para[resp_start_char_idx:resp_end_char_idx]
+
+                print(f"marked replacement: ({p1}) -> ({p2})")
+
+                # We diff on characters, and then gray whatever chars are *NOT* 'equal' according to the differ: 
+                char_differ = SequenceMatcher(None, p1, p2)
+                for char_opcode in char_differ.get_opcodes():
+                    print(char_opcode)
+                    if char_opcode[0] in ('replace', 'delete'):
+                        print(' -->', start_char_idx+char_opcode[1], start_char_idx+char_opcode[2], normed_orig_para[start_char_idx+char_opcode[1]:start_char_idx+char_opcode[2]])
+
+                        del_char_map_range(
+                            char_map_to_cur, 
+                            start_char_idx+char_opcode[1], 
+                            start_char_idx+char_opcode[2]-1
+                        )
+                        
+                    if char_opcode[0] in ('replace', 'insert'):  # we also need to account for any inserted text:
+                        insert_char_map_range(
+                            char_map_to_cur, 
+                            start_char_idx+char_opcode[1], # the starting char index of the original text where the insertion takes place
+                            char_opcode[4]-char_opcode[3]  # the length of the inserted text, in # of chars
+                        )
+            elif tag == 'insert':
+                start_char_idx = char_idx_for_word_idx(i1, split_prev_para)
+                resp_start_char_idx = char_idx_for_word_idx(j1, split_cur_para)
+                resp_end_char_idx = char_idx_for_word_idx(j2, split_cur_para)-1
+                print(f"marked insertion: {normed_cur_para[resp_start_char_idx:resp_end_char_idx+1]}")
+                insert_char_map_range(
+                    char_map_to_cur, 
+                    start_char_idx, # the starting char index of the original text where the insertion takes place
+                    resp_end_char_idx-resp_start_char_idx+1  # the length of the inserted text, in # of chars
+                )
+        
+        # We now have a partial mapping 'char_map_to_cur' from the indices of chars in the 'prev' text, to the 'cur' (revised) text.
+        # We can use this 1-level deep mapping to apply the depth mask to the original text, using previous inv_char_maps
+        for i, j in enumerate(char_map_to_cur):
+            if j is None:  # this char was deleted, so mark it
+                orig_char_idx = get_orig_text_char_idx(i, *reversed(inv_char_maps))
+                if orig_char_idx > -1:
+                    set_depth(orig_char_idx, orig_char_idx, depth)
+                else:
+                    print(f" --- could not follow char {normed_prev_para[i]} at idx, depth: {i}, {MAX_DEPTH - depth}")
+
+        # We also need to invert this mapping for it to be useful later on:
+        inv_char_maps.append(
+            invert_char_map(char_map_to_cur)
+        )
+        
+        depth -= 1
+
+    # OPTIONAL: JSON output
+    if args.json_output:
+        outpath = args.json_output
+
+        # Extract sentences for each response, at each depth:
+        resp_sentences = []
+        all_responses = [{'response': orig_paragraph}] + best_responses
+        for n, r in enumerate(all_responses):
+            resp_sentences.append(extract_sentences_from_para(r['response']))
+        
+        # Check if a sentence was deleted between shortening rounds.
+        num_sentences = len(resp_sentences[0])
+        if any(len(sentences) != num_sentences for sentences in resp_sentences[1:]):
+            print("Warning: The number of sentences changed between shortening rounds. JSON output will be inaccurate.")
+
+        # Need to convert to form: 
+        # [{"0":"...", "1":..., "2":...}, {...}, {...}]  (for example, for 3 depths, 3 sentences)
+        out = []
+        for i in range(num_sentences):
+            sentence_depths = {}
+            for n, sentences in enumerate(resp_sentences):
+                if i >= len(sentences):
+                    sentence_depths[str(n)] = ""
+                else:
+                    sentence_depths[str(n)] = sentences[i]
+            out.append(sentence_depths)
+        
+        print("-"*20 + " JSON output (NOTE: This may be only a guideline.) " + "-"*20)
+        print(json.dumps(out, indent=2))
+        with open(outpath, "w") as f:
+            json.dump(out, f)
+
+    # Visualize the graying:
+    # NOTE: In the console, we don't have access to good levels of gray, so we use colors instead
+    print("\n")
+    print("-"*20 + " Word relevance visualization " + "-"*20)
+    for i, c in enumerate(normed_orig_para):
+        print(RESET, end='')
+        color = 'black'
+        if char_depths[i] >= MAX_DEPTH:
+            color = 'blue'
+        elif char_depths[i] >= MAX_DEPTH-1:
+            color = 'green'
+        elif char_depths[i] >= MAX_DEPTH-2:
+            color = 'yellow'
+        print(colored(c, color), end='')
+    
+    # HTML output
+    if args.html_output is True:
+        print("\n")
+        print("-"*20 + " HTML code for word relevance visualization (greying) " + "-"*20)
+        # Finds continuous sequences characters with the same character depth:
+        sequences = extract_contiguous_sequences(char_depths)
+        # Produces HTML with spans wrapped around each sequence that was the same depth:
+        html_code = ""
+        for seq in sequences:
+            start, end, depth = seq['start'], seq['end'], seq['val']
+            color_id = depth if depth < len(HTML_GRAY_LEVELS) else (len(HTML_GRAY_LEVELS)-1)
+            html_code += f'<span style="color:{HTML_GRAY_LEVELS[color_id]}">' + normed_orig_para[start:end] + '</span>'
+        print(html_code)
+    
+    # LaTeX output
+    if args.latex_output is True:
+        print("\n")
+        print("-"*20 + " LaTeX code for word relevance visualization (greying) " + "-"*20)
+        # Finds continuous sequences characters with the same character depth:
+        sequences = extract_contiguous_sequences(char_depths)
+        # Produces LaTeX with \textcolor{}{} wrapped around each sequence that was the same depth:
+        latex_code = ""
+        for seq in sequences:
+            start, end, depth = seq['start'], seq['end'], seq['val']
+            color_id = depth if depth < len(LATEX_GRAY_CODES) else (len(LATEX_GRAY_CODES)-1)
+            if depth == 0:
+                latex_code += normed_orig_para[start:end]
+            else:
+                latex_code += '\\textcolor{' + LATEX_GRAY_CODES[color_id] + '}{' + normed_orig_para[start:end] + '}'
+        print(latex_code)
