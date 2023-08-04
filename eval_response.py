@@ -12,7 +12,7 @@ import diff_text
 # B = 0.25
 # C = 0.25
 # D = 0.25 
-OPTIMAL_LENGTH = 0.5
+OPTIMAL_LENGTH = 0.85
 
 
 def evaluate_on_meaning(original_paragraph, response):

@@ -29,7 +29,7 @@ from diff_text import diff_text
 import eval_response
 
 EXTRACTIVE_SHORTENER_PROMPT_TEMPLATE = \
-"""Delete 10 words or phrases from the following paragraph that don't contribute much to its meaning, but keep readability:
+"""Delete as many words or phrases as you can from the following paragraph that don't contribute much to its meaning, but keep readability:
 "${paragraph}"
 
 Please do not add any new words or change words, only delete words."""
@@ -206,6 +206,9 @@ if __name__ == "__main__":
                 "opcodes": opcodes,
                 "counts": counts,
                 "grammar_score": grammar_score,
+                "semantic_score": eval_response.evaluate_on_meaning(paragraph, response),
+                "length_score": eval_response.evaluate_on_length(paragraph, response),
+                "paraphrasing_score": eval_response.evaluate_on_paraphrasing(paragraph, response),
                 "composite_score": eval_response.composite(paragraph, response, grammar_score)
             })
 
@@ -218,18 +221,23 @@ if __name__ == "__main__":
         cur_depth += 1
 
         # Now, if cur_depth is less than MAX_DEPTH, the next iteration of the loop will feed the response back into ChatGPT:
-        best_responses.append(best_response)
-        paragraph = best_response["response"]
-
+        
         print('\n')
         print('Round ' + str(cur_depth) + ' Intermediate Results')
         for i, item in enumerate(response_infos):
             print('\n')
             print(item["reverted"])
             print('Grammar Score: ' + str(item["grammar_score"]))
+            print('Semantic Score: ' + str(item["semantic_score"]))
+            print('Length Score: ' + str(item["length_score"]))
+            print('Paraphrasing Score: ' + str(item["paraphrasing_score"]))
             print('Composite Score: ' + str(item["composite_score"]))
             if i == 0:
                 print('(Picked)')
+
+        best_responses.append(best_response)
+        paragraph = best_response["response"]
+
 
 
     print('\n')
